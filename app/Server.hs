@@ -13,6 +13,7 @@ import Control.Monad.Trans.Maybe (MaybeT (MaybeT, runMaybeT))
 import Data.Aeson qualified as Aeson
 import Data.FileEmbed (embedDir, makeRelativeToProject)
 import Data.IntMap.Strict qualified as IntMap
+import Data.Ord (clamp)
 import Data.Text qualified as Text
 import Network.Wai (Request (..))
 import Network.Wai.Middleware.Auth.OAuth2 (OAuth2 (..))
@@ -22,7 +23,11 @@ import Servant hiding (throwError, (:>))
 import Servant.OAuth2 (OAuth2Settings (..), Tag, authServer)
 import Servant.OAuth2.Cookies (getSessionIdFromCookie)
 import Servant.OAuth2.Hacks (getRedirectUrl)
-import Servant.Server.Experimental.Auth (AuthHandler, AuthServerData, mkAuthHandler)
+import Servant.Server.Experimental.Auth
+    ( AuthHandler
+    , AuthServerData
+    , mkAuthHandler
+    )
 import Servant.Server.Generic
 import Session
 import Text.Blaze.Html5 (html, (!))
@@ -36,7 +41,8 @@ deriving anyclass instance FromJSON Contributor
 deriving anyclass instance ToJSON Contributor
 
 data Env = Env
-    { githubSettings :: OAuth2Settings (Eff '[Error ServerError, IOE]) Github OAuth2Result
+    { githubSettings
+        :: OAuth2Settings (Eff '[Error ServerError, IOE]) Github OAuth2Result
     , pretixConfig :: PretixConfig
     }
 
@@ -105,6 +111,7 @@ anonRoutesServer =
                             button "github-login" url "Log in with GitHub"
                 Just session -> do
                     Env{pretixConfig = PretixConfig{storeUrl, event}} <- ask
+                    maybeContributor <- IntMap.lookup session.githubId <$> get @Contributors
                     maybeVoucher <- getVoucher session
                     let eventUrl = Text.intercalate "/" [storeUrl, event]
                     let purchaseTicketButton = button "purchase" eventUrl
@@ -113,11 +120,14 @@ anonRoutesServer =
                         Html.body . Html.main $ do
                             Html.h1 $ "Hello " <> fromText session.githubUsername
                             case maybeVoucher of
-                                Nothing -> do
-                                    Html.p "You are not currently eligible for a voucher."
-                                    purchaseTicketButton "Purchase a ticket"
-                                Just Voucher{..} -> do
+                                Just Voucher{..} | Just contributor <- maybeContributor -> do
                                     Html.p "Thank you for your contributions to the community."
+                                    Html.p "According to our data, your contributions in the past 4 years are:"
+                                    Html.ul do
+                                        Html.li . fromString $
+                                            show contributor.commits <> " merged commits to official repos"
+                                    Html.p . fromString . Text.unpack $
+                                        "You are eligible for a " <> value <> "\xA0% voucher! 🎉"
                                     if redeemed > 0
                                         then do
                                             Html.p "Your voucher has already been redeemed."
@@ -130,10 +140,14 @@ anonRoutesServer =
                                                     $ fromText code
                                                 Html.button
                                                     ! Html.Attributes.class_ "copy button"
-                                                    ! Html.Attributes.onclick "navigator.clipboard.writeText(document.getElementById('voucher-code').innerText)"
+                                                    ! Html.Attributes.onclick
+                                                        "navigator.clipboard.writeText(document.getElementById('voucher-code').innerText)"
                                                     $ mempty
                                             let url = Text.intercalate "/" [eventUrl, "redeem?voucher=" <> code]
                                             button "redeem" url "Redeem voucher"
+                                _ -> do
+                                    Html.p "You are not currently eligible for a voucher."
+                                    purchaseTicketButton "Purchase a ticket"
         , static = serveDirectoryEmbedded $(embedDir =<< makeRelativeToProject "static")
         }
   where
@@ -176,10 +190,19 @@ getVoucher
     => Session
     -> Eff es (Maybe Voucher)
 getVoucher session = runMaybeT do
-    contributor <- MaybeT $ IntMap.lookup session.githubId <$> get @Contributors
+    contributor <- MaybeT $ IntMap.lookup session.githubId <$> get
+    let percent = percentForContributions contributor.commits
     Env{pretixConfig} <- lift ask
     voucher <- lift $ case contributor.voucher of
-        Nothing -> createNewVoucher pretixConfig session
+        Nothing -> createNewVoucher percent pretixConfig session
         Just Voucher{id} -> getExistingVoucher pretixConfig id
     lift . modify . setContributor $ contributor{voucher}
     MaybeT $ pure voucher
+
+percentForContributions :: Int -> Int
+percentForContributions =
+    clamp (0, 100)
+        . (10 *)
+        . ceiling @Double
+        . (\c -> (logBase 16 (c ^ (64 - 8 :: Int)) + 5) / 10)
+        . fromIntegral
